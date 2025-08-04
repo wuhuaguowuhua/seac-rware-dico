@@ -148,13 +148,20 @@ _RWARE_KEYS_ORDER = (
     "local_message" # 1-bit local comm
 )
 
-def _flat_rware_agent(obs_dict: dict) -> np.ndarray:
-    """将单个 agent 的 RWARE obs dict 展平成 1-D float32 向量。"""
-    parts: list[np.ndarray] = []
-    for k in _RWARE_KEYS_ORDER:
-        v = obs_dict[k]
-        parts.append(np.asarray(v, dtype=np.float32).ravel())
-    return np.concatenate(parts, dtype=np.float32)
+def _flat_rware_agent(obs: Any) -> np.ndarray:
+    """将单个 agent 的 RWARE 观测展平成 1-D float32 向量。"""
+
+    # 旧版 RWARE 返回 dict 观测，键顺序为 ``_RWARE_KEYS_ORDER``；
+    # 新版/``fast_obs=True`` 时已经是 ndarray，只需展平即可。
+    if isinstance(obs, dict):
+        parts: list[np.ndarray] = []
+        for k in _RWARE_KEYS_ORDER:
+            v = obs[k]
+            parts.append(np.asarray(v, dtype=np.float32).ravel())
+        return np.concatenate(parts, dtype=np.float32)
+
+    # fallback: treat as array-like
+    return np.asarray(obs, dtype=np.float32).ravel()
 
 class FlattenMAObs(gym.Wrapper):
     """
@@ -163,7 +170,7 @@ class FlattenMAObs(gym.Wrapper):
     """
     def __init__(self, env: gym.Env):
         super().__init__(env)
-        sample: Tuple[dict, ...] = env.observation_space.sample()
+        sample: Tuple[Any, ...] = env.observation_space.sample()
         assert isinstance(sample, (list, tuple)), "期望 MA obs 是 list/tuple"
         flats = [_flat_rware_agent(a) for a in sample]
         self._n_agents  = len(flats)
@@ -184,6 +191,11 @@ class FlattenMAObs(gym.Wrapper):
         return self._flat(obs), info
 
     def step(self, action):
-        obs, rew, term, trunc, info = self.env.step(action)
+        res = self.env.step(action)
+        if len(res) == 4:  # old Gym API
+            obs, rew, done, info = res
+            term, trunc = done, False
+        else:
+            obs, rew, term, trunc, info = res
         return self._flat(obs), rew, term, trunc, info
 # ========== 实现结束 ==========
