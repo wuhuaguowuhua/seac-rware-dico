@@ -1,0 +1,32 @@
+# ------------ Wheel source for CUDA 12.1 GPUs (works with driver 535 / CUDA 12.2 runtime) ------------
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# ------------ Core numerical stack ------------
+numpy==1.26.4
+scipy==1.12.0
+pandas==2.2.2
+matplotlib==3.9.0
+
+# ------------ Deep-learning framework (GPU build) ------------
+torch==2.2.1+cu121
+torchvision==0.17.1+cu121
+
+# ------------ RL environments & helpers ------------
+gym==0.26.2                # RWARE & Supersuit still rely on classic Gym API
+pettingzoo==1.24.1         # includes multi_warehouse_v6
+supersuit==3.10.0
+lbforaging==1.0.15
+rware==1.0.3
+
+# ------------ Experiment management & logging ------------
+sacred==0.8.2
+tensorboard==2.16.2
+absl-py==2.1.0
+
+# ------------ Misc utilities ------------
+attrs==23.2.0
+cloudpickle==3.0.0
+gitpython==3.1.43
+requests==2.31.0
+tqdm==4.66.4
+PyYAML==6.0.1

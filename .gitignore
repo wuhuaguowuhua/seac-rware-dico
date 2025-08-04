@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# 数据 / 结果
+results/
+*.xztar
+# Conda / venv
+rware-dico/
+.env/
