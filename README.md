@@ -1,5 +1,5 @@
 env \
-  WANDB_API_KEY="095e2a39af55d3c6d9c1dbdb4fa3953bd7c34ada" \
+  WANDB_API_KEY="..." \
   WANDB_ENTITY="wuhuaguowuhua-university-of-exeter" \
   WANDB_PROJECT="seac-rware-dico-slow" \
   WANDB_DIR="$PWD/results/wandb" \
