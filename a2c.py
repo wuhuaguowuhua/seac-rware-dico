@@ -1,238 +1,253 @@
-# a2c.py — A2C / SEAC (with SND) 针对旧式 RolloutStorage(obs_space, action_space, rhs, num_steps, num_processes) 适配版
+# a2c.py  -- drop-in replacement
 from __future__ import annotations
-import numpy as np
+import math
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from sacred import Ingredient
 
-from storage import RolloutStorage  # 你的项目里已有
+from snd_w2 import build_move_cost, snd_w2_per_agent  # 新增：W2-SND
 
-# ============== Sacred ingredient: algorithm 超参 ==============
-algorithm = Ingredient("algorithm")
+Tensor = torch.Tensor
 
-@algorithm.config
-def _algo_cfg():
-    # 采样与设备
-    num_processes = 1
-    num_steps = 5
-    device = "cpu"
+# --------------------------- Model ---------------------------
 
-    # 学习率与优化
-    lr = 3e-4
-    eps = 1e-5
-    max_grad_norm = 0.5
+class ActorCritic(nn.Module):
+    def __init__(self, obs_dim: int, hidden: int = 128):
+        super().__init__()
+        self.base = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True),
+        )
+        self.actor_move = nn.Linear(hidden, 5)  # L,R,U,D,Stay
+        self.actor_msg  = nn.Linear(hidden, 2)  # 1-bit message
+        self.critic     = nn.Linear(hidden, 1)
 
-    # A2C 损失系数
-    gamma = 0.99
-    gae_lambda = 0.95
-    entropy_coef = 0.01
-    value_loss_coef = 0.5
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain('relu'))
+                nn.init.constant_(m.bias, 0.)
 
-    # SEAC / SND
-    seac_coef = 1.0   # 共享经验项权重
-    snd_coef  = 0.10  # SND 正则权重（可调）
+    def forward(self, obs: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        x = self.base(obs)
+        move_logits = self.actor_move(x)  # [B,5]
+        msg_logits  = self.actor_msg(x)   # [B,2]
+        value       = self.critic(x).squeeze(-1)  # [B]
+        return move_logits, msg_logits, value
 
-# ========================= A2C 封装 ============================
+    def act(self, obs: Tensor):
+        move_logits, msg_logits, value = self.forward(obs)
+        dist_m = Categorical(logits=move_logits)
+        dist_c = Categorical(logits=msg_logits)
+        a_m = dist_m.sample()
+        a_c = dist_c.sample()
+        logp = dist_m.log_prob(a_m) + dist_c.log_prob(a_c)
+        entropy = dist_m.entropy() + dist_c.entropy()
+        return a_m, a_c, logp, value, (move_logits, msg_logits, entropy)
+
+    def evaluate(self, obs: Tensor, a_m: Tensor, a_c: Tensor):
+        move_logits, msg_logits, value = self.forward(obs)
+        dist_m = Categorical(logits=move_logits)
+        dist_c = Categorical(logits=msg_logits)
+        logp = dist_m.log_prob(a_m) + dist_c.log_prob(a_c)
+        entropy = dist_m.entropy() + dist_c.entropy()
+        return logp, entropy, value, move_logits, msg_logits
+
+# --------------------------- Storage ---------------------------
+
+@dataclass
+class RolloutStorage:
+    num_steps: int
+    num_envs: int
+    obs_dim: int
+    device: torch.device
+
+    def __post_init__(self):
+        T, N, D = self.num_steps, self.num_envs, self.obs_dim
+        self.obs      = torch.zeros(T + 1, N, D, device=self.device)
+        self.rewards  = torch.zeros(T, N, device=self.device)
+        self.masks    = torch.ones(T + 1, N, device=self.device)
+        self.a_move   = torch.zeros(T, N, dtype=torch.long, device=self.device)
+        self.a_msg    = torch.zeros(T, N, dtype=torch.long, device=self.device)
+        self.logp     = torch.zeros(T, N, device=self.device)
+        self.values   = torch.zeros(T + 1, N, device=self.device)
+        self.returns  = torch.zeros(T + 1, N, device=self.device)
+        self.step = 0
+
+    def insert(self, obs, a_m, a_c, logp, value, reward, mask):
+        t = self.step
+        self.obs[t+1].copy_(obs)
+        self.a_move[t].copy_(a_m)
+        self.a_msg[t].copy_(a_c)
+        self.logp[t].copy_(logp)
+        self.values[t].copy_(value)
+        self.rewards[t].copy_(reward)
+        self.masks[t+1].copy_(mask)
+        self.step = t + 1
+
+    def after_update(self):
+        self.obs[0].copy_(self.obs[-1])
+        self.masks[0].copy_(self.masks[-1])
+        self.values[-1].zero_()
+        self.step = 0
+
+    def compute_returns(self, gamma: float, gae_lambda: float):
+        T = self.num_steps
+        gae = torch.zeros(self.num_envs, device=self.device)
+        self.returns[-1].copy_(self.values[-1])  # bootstrap
+        for t in reversed(range(T)):
+            delta = self.rewards[t] + gamma * self.values[t+1] * self.masks[t+1] - self.values[t]
+            gae = delta + gamma * gae_lambda * self.masks[t+1] * gae
+            self.returns[t] = gae + self.values[t]
+
+# --------------------------- Agent ---------------------------
+
 class A2C:
-    def __init__(
-        self,
-        agent_id: int,
-        obs_space,
-        act_space,
-        num_envs: int,
-        num_steps: int,
-        device: str = "cpu",
-        lr: float = 3e-4,
-        eps: float = 1e-5,
-        gamma: float = 0.99,
-        gae_lambda: float = 0.95,
-        entropy_coef: float = 0.01,
-        value_loss_coef: float = 0.5,
-        max_grad_norm: float = 0.5,
-    ):
-        self.agent_id = agent_id
-        self.device = torch.device(device)
+    def __init__(self, obs_dim: int, num_envs: int, cfg: dict, device: torch.device):
+        self.device = device
+        self.gamma = float(cfg.get("gamma", 0.99))
+        self.gae_lambda = float(cfg.get("gae_lambda", 0.95))
+        self.entropy_coef = float(cfg.get("entropy_coef", 0.01))
+        self.value_coef = float(cfg.get("value_coef", 0.5))
+        self.lr = float(cfg.get("lr", 3e-4))
+        self.max_grad_norm = float(cfg.get("max_grad_norm", 0.5))
+        self.amp = bool(cfg.get("amp", True))
 
-        # 保存 Gym space 本体，便于构造旧式 RolloutStorage
-        self._obs_space = obs_space
-        self._act_space = act_space
+        self.snd_metric = cfg.get("snd_metric", "w2")  # 'w2' or 'js'
+        self.snd_coef = float(cfg.get("snd_coef", 0.10))
+        self.snd_alpha_msg = float(cfg.get("snd_alpha_msg", 0.25))
+        self.snd_warmup_updates = int(cfg.get("snd_warmup_updates", 2000))
 
-        self.obs_dim = int(np.prod(obs_space.shape))
-        self.act_dim = int(getattr(act_space, "n", 1))
+        self.seac_coef = float(cfg.get("seac_coef", 1.0))
+        self.seac_clip = float(cfg.get("seac_clip", 5.0))
+        self.seac_warmup_updates = int(cfg.get("seac_warmup_updates", 2000))
 
-        # 损失/优化超参
-        self.lr = lr
-        self.eps = eps
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.entropy_coef = entropy_coef
-        self.value_loss_coef = value_loss_coef
-        self.max_grad_norm = max_grad_norm
+        self.entropy_anneal_to = float(cfg.get("entropy_anneal_to", 0.001))
+        self.entropy_anneal_steps = int(cfg.get("entropy_anneal_steps", 20000))
+        self.update_count = 0
 
-        # rollout / 模型 / 优化器
-        self.storage = None  # type: ignore
-        self.model = None    # attach_model 后可用
-        self.optimizer = None
+        self.model = ActorCritic(obs_dim).to(self.device)
+        self.optim = torch.optim.Adam(self.model.parameters(), lr=self.lr, eps=1e-5)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
 
-        self._num_envs = int(num_envs)
-        self._num_steps = int(num_steps)
-
-    # -------- 在创建好策略网络后调用 ----------
-    def attach_model(self, model: torch.nn.Module):
-        """挂载策略/价值网络，并创建 optimizer 与 RolloutStorage（按你工程的旧式签名构造）。"""
-        self.model = model.to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, eps=self.eps)
-
-        rhss = int(getattr(self.model, "recurrent_hidden_state_size", 1))
-
-        # 你的 RolloutStorage 签名：
-        # __init__(obs_space, action_space, recurrent_hidden_state_size, num_steps, num_processes)
         self.storage = RolloutStorage(
-            self._obs_space,
-            self._act_space,
-            rhss,
-            self._num_steps,
-            self._num_envs,
+            num_steps=int(cfg.get("num_steps", 5)),
+            num_envs=num_envs, obs_dim=obs_dim, device=self.device
         )
 
-    # --------- GAE/Returns（用当前模型估值末状态） ----------
+        # W2 代价矩阵（移动头）
+        self.C_move = build_move_cost(self.device)
+
+    # ---- 动作 ----
     @torch.no_grad()
-    def compute_returns(self):
-        assert self.model is not None and self.storage is not None
-        N = self._num_envs
-        obs_last = self.storage.obs[-1].view(-1, self.obs_dim)  # (n_envs, obs_dim)
-        _, value_last = self.model.forward(obs_last)  # type: ignore
-        value_last = value_last.view(N, 1)
+    def act(self, obs: Tensor):
+        return self.model.act(obs)
 
-        # 你的 RolloutStorage 版本需要: (next_value, use_gae, gamma, gae_lambda)
-        # 我们优先尝试这个签名；若失败，再逐级回退，最大化兼容不同老版本。
-        try:
-            # 首选：位置参数形式
-            self.storage.compute_returns(value_last, True, self.gamma, self.gae_lambda)
-            return
-        except TypeError:
-            pass
+    # ---- 训练一步 ----
+    def update(self, all_agents: List["A2C"]) -> Dict[str, float]:
+        self.storage.compute_returns(self.gamma, self.gae_lambda)
 
-        try:
-            # 其次：关键字形式
-            self.storage.compute_returns(
-                next_value=value_last, use_gae=True, gamma=self.gamma, gae_lambda=self.gae_lambda
+        T, N = self.storage.num_steps, self.storage.num_envs
+        obs_flat = self.storage.obs[:-1].reshape(T*N, -1)
+        a_m_flat = self.storage.a_move.reshape(T*N)
+        a_c_flat = self.storage.a_msg.reshape(T*N)
+        ret_flat = self.storage.returns[:-1].reshape(T*N)
+        val_flat = self.storage.values[:-1].reshape(T*N)
+        adv = ret_flat - val_flat
+        # 优势归一化（每次 update）
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        # 主策略项
+        with torch.cuda.amp.autocast(enabled=self.amp):
+            logp, entropy, value_pred, move_logits, msg_logits = self.model.evaluate(obs_flat, a_m_flat, a_c_flat)
+            policy_loss = -(adv * logp).mean()
+            value_loss = F.mse_loss(value_pred, ret_flat)
+            entropy_loss = - entropy.mean()  # 惩罚项写成 loss 相加
+
+        # ---- SEAC ----
+        # 用本智能体的观测 obs_flat，对其他智能体的 (a_m,a_c) 计算对数似然，
+        # 权重使用本智能体的 adv；外加温和裁剪与退火。
+        seac_loss = torch.tensor(0., device=self.device)
+        if self.seac_coef > 0 and len(all_agents) > 1:
+            with torch.cuda.amp.autocast(enabled=self.amp):
+                for ag in all_agents:
+                    if ag is self:  # 跳过自己
+                        continue
+                    a_m_j = ag.storage.a_move.reshape(T*N).detach()
+                    a_c_j = ag.storage.a_msg.reshape(T*N).detach()
+                    logp_j, _, _, _, _ = self.model.evaluate(obs_flat, a_m_j, a_c_j)
+                    # 比率裁剪（用 exp(logp_j - self.logp_i) 近似），防止偏移项过大
+                    ratio = torch.exp(logp_j - logp.clamp(-20, 20)).clamp(0., self.seac_clip)
+                    seac_term = -(ratio * adv.detach() * logp_j).mean()
+                    seac_loss = seac_loss + seac_term
+            seac_loss = seac_loss / max(1, len(all_agents)-1)
+            # 退火：前 warmup 逐步从 0 → seac_coef
+            warm = min(1.0, self.update_count / max(1, self.seac_warmup_updates))
+            seac_loss = self.seac_coef * warm * seac_loss
+
+        # ---- SND（W2 或 JS）----
+        snd_loss = torch.tensor(0., device=self.device)
+        if self.snd_coef > 0 and len(all_agents) > 1:
+            with torch.no_grad():
+                # 准备各 agent 的 softmax 概率（基于各自的 obs_flat）
+                # 这里“对齐时间步”的做法与 SEAC 一致：同一批次 (T*N)。
+                mv_probs, ms_probs = [], []
+                for ag in all_agents:
+                    mv_lg, ms_lg, _ = ag.model.forward(ag.storage.obs[:-1].reshape(T*N, -1))
+                    mv_probs.append(F.softmax(mv_lg, dim=-1))
+                    ms_probs.append(F.softmax(ms_lg, dim=-1))
+            # 只给当前 agent 传梯度：其自身概率用 requires_grad 的前向再算一次
+            mv_lg_i, ms_lg_i, _ = self.model.forward(self.storage.obs[:-1].reshape(T*N, -1))
+            mv_probs[self._idx_in(all_agents)] = F.softmax(mv_lg_i, dim=-1)  # 替换本体
+            ms_probs[self._idx_in(all_agents)] = F.softmax(ms_lg_i, dim=-1)
+
+            # 计算 per-agent 的 SND 贡献
+            snd_per_agent = snd_w2_per_agent(
+                move_probs_list=mv_probs,
+                msg_probs_list=ms_probs,
+                C_move=self.C_move,
+                alpha_msg=self.snd_alpha_msg,
+                detach_others=True
             )
-            return
-        except TypeError:
-            pass
+            # 我只取自己的那份
+            snd_i = snd_per_agent[self._idx_in(all_agents)]
+            # 退火：前 warmup 逐步从 0 → snd_coef，后期可保持或缓降（需可配）
+            warm = min(1.0, self.update_count / max(1, self.snd_warmup_updates))
+            snd_loss = -(self.snd_coef * warm) * snd_i  # maximize SND → minimize (−SND)
 
-        try:
-            # 再次退回：老式 (next_value, gamma, gae_lambda)
-            self.storage.compute_returns(value_last, self.gamma, self.gae_lambda)
-            return
-        except TypeError:
-            pass
+        # ---- 熵系数退火 ----
+        if self.entropy_anneal_steps > 0:
+            frac = min(1.0, self.update_count / self.entropy_anneal_steps)
+            ent_coef = (1-frac) * self.entropy_coef + frac * self.entropy_anneal_to
+        else:
+            ent_coef = self.entropy_coef
 
-        try:
-            # 最老的实现：只接受 next_value
-            self.storage.compute_returns(value_last)
-            return
-        except TypeError:
-            # 如果还不行，就明确报错，提醒贴出 compute_returns 的源码
-            raise TypeError(
-                "Unsupported RolloutStorage.compute_returns signature. "
-                "Please share its definition so we can adapt."
-            )
+        total_loss = policy_loss + self.value_coef * value_loss + ent_coef * entropy_loss + seac_loss + snd_loss
 
-    # --------- 核心：一次参数更新（支持 SEAC + SND） ----------
-    def update(
-        self,
-        storages_all_agents,
-        snd_logits_batch=None,
-        snd_coef: float = 0.0,
-        seac_coef: float = 1.0,
-    ):
-        """
-        storages_all_agents: list[RolloutStorage]，包含所有智能体的 rollout
-        snd_logits_batch:    list[Tensor]，每个元素是“某个智能体在自己的 rollout 上 forward 得到的 logits”，
-                             只作为 SND 参照；**请在外部对非本体 logits 调用 .detach()**。
-        """
-        assert self.model is not None and self.optimizer is not None and self.storage is not None
-        device = next(self.model.parameters()).device
-
-        # ---- 本体 on-policy 数据 ----
-        T, N = self._num_steps, self._num_envs
-        obs      = self.storage.obs[:-1].reshape(T * N, self.obs_dim).to(device)
-        actions  = self.storage.actions.reshape(T * N, 1).to(device).long()
-        returns  = self.storage.returns[:-1].reshape(T * N, 1).to(device)
-
-        logits, values = self.model.forward(obs)  # (TN, act_dim), (TN, 1)
-        dist = Categorical(logits=logits)
-        log_prob = dist.log_prob(actions.squeeze(-1)).unsqueeze(-1)  # (TN,1)
-        entropy = dist.entropy().mean()
-
-        advantages = (returns - values).detach()
-        policy_loss = -(log_prob * advantages).mean()
-        value_loss  = F.mse_loss(values, returns)
-
-        # ---- SEAC: 用“他人”rollout 帮我更新（重要性采样校正）----
-        seac_loss = torch.zeros((), device=device)
-        others = [s for s in storages_all_agents if s is not self.storage]
-        for other in others:
-            o_obs     = other.obs[:-1].reshape(T * N, self.obs_dim).to(device)
-            o_actions = other.actions.reshape(T * N, 1).to(device).long()
-            o_returns = other.returns[:-1].reshape(T * N, 1).to(device)
-
-            # 当前 agent 在“他人”的数据上评估
-            o_logits, o_values = self.model.forward(o_obs)  # (TN,a), (TN,1)
-            o_dist   = Categorical(logits=o_logits)
-            log_pi_i = o_dist.log_prob(o_actions.squeeze(-1)).unsqueeze(-1)
-            # 他人在采样时的 log pi（缓冲区已存）
-            log_pi_j = other.action_log_probs.reshape(T * N, 1).to(device).detach()
-            rho = torch.exp(log_pi_i - log_pi_j)  # importance ratio（只对本体开梯度）
-
-            o_adv = (o_returns - o_values).detach()
-            seac_loss = seac_loss - (rho * log_pi_i * o_adv).mean()
-
-        if len(others) > 0:
-            seac_loss = seac_loss / len(others)
-
-        # ---- SND 正则（真正加入 loss）----
-        snd_loss = torch.zeros((), device=device)
-        if snd_logits_batch is not None:
-            snd_loss = self.model.snd_regularisation(snd_logits_batch)  # type: ignore
-
-        # ---- 总损失 & 更新 ----
-        loss = (
-            policy_loss
-            + self.value_loss_coef * value_loss
-            - self.entropy_coef * entropy
-            + seac_coef * seac_loss
-            + snd_coef  * snd_loss
-        )
-
-        self.optimizer.zero_grad()
-        loss.backward()
+        self.optim.zero_grad(set_to_none=True)
+        self.scaler.scale(total_loss).backward()
+        self.scaler.unscale_(self.optim)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-        self.optimizer.step()
+        self.scaler.step(self.optim)
+        self.scaler.update()
+
+        self.update_count += 1
 
         return {
-            "loss":        float(loss.detach().cpu().item()),
-            "policy_loss": float(policy_loss.detach().cpu().item()),
-            "value_loss":  float(value_loss.detach().cpu().item()),
-            "entropy":     float(entropy.detach().cpu().item()),
-            "seac_loss":   float(seac_loss.detach().cpu().item()),
-            "snd_loss":    float(snd_loss.detach().cpu().item()),
+            "policy_loss": float(policy_loss.item()),
+            "value_loss": float(value_loss.item()),
+            "entropy":    float((-entropy_loss).item()),
+            "seac_loss":  float(seac_loss.item()),
+            "snd_loss":   float(snd_loss.item()),
+            "ent_coef":   float(ent_coef),
         }
 
-    # --------- 便捷的存取接口（与 train_new.py 配合） ----------
-    def save(self, file_path: str):
-        assert self.model is not None and self.optimizer is not None
-        torch.save(
-            {"model": self.model.state_dict(), "optimizer": self.optimizer.state_dict()},
-            file_path,
-        )
-
-    def load(self, file_path: str):
-        assert self.model is not None
-        state = torch.load(file_path, map_location=self.device)
-        self.model.load_state_dict(state["model"], strict=False)
-        if "optimizer" in state and self.optimizer is not None:
-            self.optimizer.load_state_dict(state["optimizer"])
+    def _idx_in(self, all_agents: List["A2C"]) -> int:
+        for k, ag in enumerate(all_agents):
+            if ag is self: return k
+        return 0

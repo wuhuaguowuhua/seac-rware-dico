@@ -1,341 +1,211 @@
-# train_new.py — SEAC + SND + W&B(TensorBoard sync)
-import glob
-import logging
-import os
-import shutil
-import time
-from collections import deque
-from os import path
-from pathlib import Path
+# train_new.py  -- SEAC + SND(W2/JS) 训练脚本（Sacred + 可选 W&B）
+from __future__ import annotations
+import os, random, time
+from typing import List, Dict
 
 import numpy as np
 import torch
-import gym
-from gym import spaces
 from sacred import Experiment
-from sacred.observers import FileStorageObserver
-from torch.utils.tensorboard import SummaryWriter
+from sacred.utils import apply_backspaces_and_linefeeds
 
-import utils
-from a2c import A2C, algorithm
 from envs import make_vec_envs
-from wrappers import RecordEpisodeStatistics, SquashDones
-from het_control.het_control_mlp_empirical import DiCoSNDPolicy
+from a2c import A2C
 
-import rware      # noqa: 注册环境
-import lbforaging # noqa: 注册环境
+# ---- 可选 W&B（未安装也不影响运行）----
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except Exception:
+    wandb = None
+    _WANDB_AVAILABLE = False
 
-# ---------------------- Sacred & logging -------------------------
-ex = Experiment("seac-rware", ingredients=[algorithm], save_git_info=False)
-ex.captured_out_filter = lambda captured_output: "Output capturing turned off."
-ex.observers.append(FileStorageObserver("./results/sacred"))
+ex = Experiment("seac-rware")
+ex.captured_out_filter = apply_backspaces_and_linefeeds
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="(%(process)d) [%(levelname).1s] - (%(asctime)s) - %(name)s >> %(message)s",
-    datefmt="%m/%d %H:%M:%S",
-)
-
+# -------------------- 默认配置 --------------------
 @ex.config
-def _config():
-    env_name = None
-    time_limit = None
-    wrappers = (RecordEpisodeStatistics, SquashDones)
-    dummy_vecenv = False
+def cfg():
+    env_name = "rware-tiny-4ag-easy-v1"
+    seed = 0
+    dummy_vecenv = True
+    log_interval = 500
+    save_interval = 10000
+    eval_interval = 0
+    results_dir = "./results"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    num_env_steps = 100e6  # 可在命令行覆盖
+    # 这里加入 num_env_steps，避免 Sacred 报“新增未使用”
+    num_env_steps = 400000
 
-    eval_dir = "./results/video/{id}"
-    loss_dir = "./results/loss/{id}"
-    save_dir = "./results/trained_models/{id}"
+    # W&B（默认关闭；按需在命令行打开 use_wandb=True）
+    use_wandb = False
+    wandb_project = "seac-rware"
+    wandb_run_name = None
 
-    log_interval = 2000
-    save_interval = int(1e6)
-    eval_interval = int(1e6)
-    episodes_per_eval = 8
+    algorithm = dict(
+        num_processes = 1,
+        num_steps = 5,
+        gamma = 0.99,
+        gae_lambda = 0.95,
+        lr = 3e-4,
+        value_coef = 0.5,
+        entropy_coef = 0.01,
+        entropy_anneal_to = 0.001,
+        entropy_anneal_steps = 20000,
+        max_grad_norm = 0.5,
+        amp = True,
 
-    # ====== 新增：W&B 开关与项目名 ======
-    use_wandb = True
-    wandb_project = "seac-rware-dico"
+        # SND
+        snd_metric = "w2",    # {'w2','js'}
+        snd_coef = 0.10,
+        snd_alpha_msg = 0.25,
+        snd_warmup_updates = 2000,
 
-# 载入额外 YAML 配置（如存在）
-for conf in glob.glob("configs/*.yaml"):
-    ex.add_named_config(Path(conf).stem, conf)
+        # SEAC
+        seac_coef = 1.0,
+        seac_clip = 5.0,
+        seac_warmup_updates = 2000,
 
-def _squash_info(info):
-    info = [i for i in info if i]
-    keys = {k for d in info for k in d.keys() if k != "TimeLimit.truncated"}
-    return {k: np.mean([np.array(d[k]).sum() for d in info if k in d]) for k in keys}
-
-# ------------------------ 评估（可被 eval_interval 触发） ------------------------
-@ex.capture
-def evaluate(
-    agents,
-    monitor_dir,
-    episodes_per_eval,
-    env_name,
-    seed,
-    wrappers,
-    dummy_vecenv,
-    time_limit,
-    algorithm,
-    _log,
-):
-    device = algorithm["device"]
-
-    eval_envs = make_vec_envs(
-        env_name,
-        seed,
-        dummy_vecenv,
-        episodes_per_eval,
-        time_limit,
-        wrappers,
-        device,
-        monitor_dir=monitor_dir,
+        # （可选）若你坚持传 algorithm.device=cuda，也支持
+        # device = None,
     )
 
-    n_obs = eval_envs.reset()  # list[n_agents] of (episodes_per_eval, feat)
-    n_recurrent_hidden_states = [
-        torch.zeros(episodes_per_eval, a.model.recurrent_hidden_state_size, device=device)
-        for a in agents
-    ]
-    masks = torch.zeros(episodes_per_eval, 1, device=device)
+# -------------------- 小工具 --------------------
+def set_seed(seed: int):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-    all_infos = []
-    while len(all_infos) < episodes_per_eval:
-        with torch.no_grad():
-            _, n_action, _, n_recurrent_hidden_states = zip(
-                *[
-                    a.model.act(n_obs[a.agent_id], h, masks)
-                    for a, h in zip(agents, n_recurrent_hidden_states)
-                ]
-            )
-        n_obs, _, done, infos = eval_envs.step(n_action)
-        all_infos.extend([i for i in infos if i])
-
-    eval_envs.close()
-    s = _squash_info(all_infos)
-    if s:
-        _log.info(f"Eval mean reward {s.get('episode_reward', 0.0):.4f}")
-
-# ------------------------------- main -------------------------------
+# -------------------- 主函数 --------------------
 @ex.automain
-def main(
-    _run,
-    _log,
-    num_env_steps,
-    env_name,
-    seed,
-    algorithm,
-    dummy_vecenv,
-    time_limit,
-    wrappers,
-    save_dir,
-    eval_dir,
-    loss_dir,
-    log_interval,
-    save_interval,
-    eval_interval,
-    use_wandb,
-    wandb_project,
-):
-    # -------- 先解析路径（W&B 需要 TB 的目录） --------
-    loss_dir_resolved = path.expanduser(loss_dir.format(id=_run._id)) if loss_dir else None
-    eval_dir = path.expanduser(eval_dir.format(id=_run._id))
-    save_dir = path.expanduser(save_dir.format(id=_run._id))
-    utils.cleanup_log_dir(eval_dir)
-    utils.cleanup_log_dir(save_dir)
+def main(_config):
+    cfg = _config
+    set_seed(int(cfg["seed"]))
 
-    # -------- [新增] W&B 初始化（必须在创建 SummaryWriter 之前） --------
+    # 允许 algorithm.device 覆盖顶层 device（两种写法都生效）
+    alg_dev = cfg["algorithm"].get("device", None)
+    dev_name = alg_dev if alg_dev is not None else cfg.get("device", "cpu")
+    device = torch.device(dev_name)
+
+    # ----- W&B 可选启用 -----
+    use_wandb = bool(cfg.get("use_wandb", False))
+    if use_wandb and not _WANDB_AVAILABLE:
+        print("[warn] wandb 未安装，已自动关闭（pip install wandb 即可启用）。")
+        use_wandb = False
     if use_wandb:
-        try:
-            import wandb  # 懒加载，避免没装包时报错
-            cfg = dict(algorithm)
-            cfg.update({
-                "env_name": env_name,
-                "seed": seed,
-                "num_env_steps": num_env_steps,
-                "log_interval": log_interval,
-                "save_interval": save_interval,
-                "eval_interval": eval_interval,
-            })
-            wandb.init(
-                project=wandb_project,
-                name=f"{env_name}-seed{seed}-id{_run._id}",
-                config=cfg,
-                sync_tensorboard=True,  # 同步 TB 到 W&B
-            )
-            if loss_dir_resolved:  # 可选：确保目录存在
-                os.makedirs(loss_dir_resolved, exist_ok=True)
-        except Exception as e:
-            _log.warning(f"W&B 初始化失败（将继续本地 TensorBoard）：{e}")
-            use_wandb = False
+        run_name = cfg.get("wandb_run_name") or f"{cfg['env_name']}-{time.strftime('%m%d-%H%M')}"
+        wandb.init(project=cfg.get("wandb_project","seac-rware"),
+                   name=run_name, config=cfg)
 
-    # -------- 创建 TensorBoard writer（W&B 若开启会自动同步） --------
-    writer = SummaryWriter(loss_dir_resolved) if loss_dir_resolved else None
-
-    torch.set_num_threads(1)
-
-    # ---------- 创建向量环境 ----------
+    # 1) 环境
     envs = make_vec_envs(
-        env_name,
-        seed,
-        dummy_vecenv,
-        algorithm["num_processes"],
-        time_limit,
-        wrappers,
-        algorithm["device"],
+    cfg["env_name"],                          # env_name (str)
+    int(cfg["seed"]),                         # seed
+    bool(cfg.get("dummy_vecenv", True)),      # dummy_vecenv
+    int(cfg["algorithm"]["num_processes"]),   # num_processes
+    None,                                     # video_dir/time_limit（你这版是 None）
+    (),                                       # frame_stack / wrappers
+    "cpu",                                    # device（底层 env 用 CPU，模型 device=cfg['device']）
     )
+    obs = envs.reset()  # 约定: list[n_agents] of Tensor(n_envs, feat)
+    # 直接从 obs 推断智能体数量，避免访问 env 属性
+    n_agents = len(obs) if isinstance(obs, (list, tuple)) else 1
+    n_envs   = envs.num_envs
+    feat_dim = obs[0].shape[-1]
 
-    # 观测形状：(n_agents, feat_dim)
-    obs_shape = envs.observation_space.shape
-    n_agents  = int(obs_shape[0])
-    feat_dim  = int(obs_shape[1])
-
-    # 按智能体的 obs/act 空间
-    obs_spaces = [
-        spaces.Box(low=-np.inf, high=np.inf, shape=(feat_dim,), dtype=np.float32)
-        for _ in range(n_agents)
-    ]
-    act_spaces = envs.action_space
-    assert isinstance(act_spaces, (list, tuple)) and len(act_spaces) == n_agents, \
-        "env.action_space 必须是长度为 n_agents 的列表"
-
-    act_dims = np.asarray([int(getattr(a, "n", 1)) for a in act_spaces], dtype=np.int64)
-
-    # ---------- 构造 A2C + DiCoSNDPolicy ----------
-    agents = []
+    # 2) 智能体
+    agents: List[A2C] = []
     for i in range(n_agents):
-        a = A2C(
-            i, obs_spaces[i], act_spaces[i],
-            num_envs=algorithm["num_processes"],
-            num_steps=algorithm["num_steps"],
-            device=algorithm["device"],
-            lr=algorithm["lr"],
-            eps=algorithm["eps"],
-            gamma=algorithm["gamma"],
-            gae_lambda=algorithm["gae_lambda"],
-            entropy_coef=algorithm["entropy_coef"],
-            value_loss_coef=algorithm["value_loss_coef"],
-            max_grad_norm=algorithm["max_grad_norm"],
-        )
-        m = DiCoSNDPolicy(
-            obs_dim=feat_dim,
-            act_dim=int(act_dims[i]),
-            num_agents=n_agents,
-            hidden_dim=128,
-            desired_snd=1.0,
-            snd_warmup_steps=5_000,
-        ).to(algorithm["device"])
-        a.attach_model(m)
-        agents.append(a)
+        ag = A2C(obs_dim=feat_dim, num_envs=n_envs, cfg=cfg["algorithm"], device=device)
+        ag.storage.obs[0].copy_(obs[i].to(device))
+        agents.append(ag)
 
-    # ---------- 初始化 rollout ----------
-    obs = envs.reset()  # list[n_agents] of (n_envs, feat)
-    for i in range(n_agents):
-        agents[i].storage.obs[0].copy_(obs[i])   # 放入起始 obs
-        agents[i].storage.to(algorithm["device"])
+    # 3) 训练循环
+    steps_per_update = n_envs * int(cfg["algorithm"]["num_steps"])
+    total_env_steps  = int(cfg.get("num_env_steps", 400000))
+    num_updates = max(1, total_env_steps // steps_per_update)
 
-    start = time.time()
-    num_updates = int(num_env_steps) // algorithm["num_steps"] // algorithm["num_processes"]
-    all_infos = deque(maxlen=10)
-
-    # ============================ 训练主循环 ============================
+    t0 = time.time()
     for j in range(1, num_updates + 1):
-        # ------- 采样 num_steps -------
-        for step in range(algorithm["num_steps"]):
-            with torch.no_grad():
-                outs = [
-                    a.model.act(  # type: ignore
-                        a.storage.obs[step],
-                        a.storage.recurrent_hidden_states[step],
-                        a.storage.masks[step],
-                    ) for a in agents
-                ]
-                n_value, n_action, n_action_log_prob, n_recurrent_hidden_states = zip(*outs)
+        # --- 收集 rollout ---
+        for step in range(cfg["algorithm"]["num_steps"]):
+            actions = []
+            for i, ag in enumerate(agents):
+                with torch.no_grad():
+                    a_m, a_c, logp, value, _ = ag.act(ag.storage.obs[step].to(device))
+                a_np = torch.stack([a_m, a_c], dim=1).cpu().numpy().astype(np.int64)
+                actions.append(a_np)
 
-            next_obs, reward, done, infos = envs.step(n_action)
-            masks = torch.tensor([[0.0] if d else [1.0] for d in done], dtype=torch.float32)
-            bad_masks = torch.tensor(
-                [[0.0] if info.get("TimeLimit.truncated", False) else [1.0] for info in infos],
-                dtype=torch.float32,
-            )
+            next_obs, reward, done, info = envs.step(actions)
 
-            for a in agents:
-                i = a.agent_id
-                a.storage.insert(
-                    next_obs[i],
-                    n_recurrent_hidden_states[i],
-                    n_action[i],
-                    n_action_log_prob[i],
-                    n_value[i],
-                    reward[:, i].unsqueeze(1),  # (n_envs,1)
-                    masks,
-                    bad_masks,
+            # 规整奖励/掩码
+            if isinstance(reward, list):
+                rew = torch.as_tensor(np.asarray(reward), dtype=torch.float32)
+            else:
+                rew = torch.as_tensor(reward, dtype=torch.float32)
+            if isinstance(done, (list, tuple, np.ndarray)):
+                m = 1.0 - torch.as_tensor(np.asarray(done), dtype=torch.float32)
+            else:
+                m = 1.0 - torch.as_tensor(done, dtype=torch.float32)
+
+            for i, ag in enumerate(agents):
+                ag.storage.insert(
+                    obs=next_obs[i].to(device),
+                    a_m=torch.as_tensor(actions[i][:,0], device=device),
+                    a_c=torch.as_tensor(actions[i][:,1], device=device),
+                    logp=torch.zeros(n_envs, device=device),
+                    value=torch.zeros(n_envs, device=device),
+                    reward=rew[:, i] if rew.ndim == 2 else rew,  # 兼容 list/ndarray
+                    mask=m,
                 )
-            all_infos.extend([i for i in infos if i])
 
-        # ------- 计算 returns -------
-        for a in agents:
-            a.compute_returns()
+        # --- 更新 ---
+        per_agent_logs: List[Dict[str, float]] = []
+        for ag in agents:
+            logs = ag.update(agents)
+            per_agent_logs.append(logs)
+            ag.storage.after_update()
 
-        # ------- 更新每个智能体（SEAC + SND）-------
-        for a in agents:
-            # 组装 SND 的参照 logits（他人的 logits 不反传）
-            logits_batch = [
-                other.model.forward(other.storage.obs[:-1].view(-1, other.model.obs_dim))[0].detach()  # type: ignore
-                for other in agents
-            ]
-            loss_dict = a.update(
-                [ag.storage for ag in agents],
-                snd_logits_batch=logits_batch,
-                snd_coef=float(algorithm.get("snd_coef", 0.10)),
-                seac_coef=float(algorithm.get("seac_coef", 1.0)),
-            )
+        # --- 日志 ---
+        steps_done = j * steps_per_update
+        dt = time.time() - t0
+        fps = steps_done / max(1e-6, dt)
 
-            if writer:
-                for k, v in loss_dict.items():
-                    writer.add_scalar(f"agent{a.agent_id}/{k}", v, j)
+        meanR = 0.0
+        if isinstance(info, dict) and "episode_reward" in info:
+            ep = info["episode_reward"]
+            if isinstance(ep, (list, np.ndarray)):
+                meanR = float(np.asarray(ep).mean())
+            elif torch.is_tensor(ep):
+                meanR = float(ep.float().mean().item())
+            else:
+                meanR = float(ep)
 
-            # 可选的内部调度（若模型内定义了 SND warmup）
-            a.model.step_scheduler()  # type: ignore
-            a.storage.after_update()
+        if j % int(cfg["log_interval"]) == 0:
+            pol = np.mean([l["policy_loss"] for l in per_agent_logs])
+            val = np.mean([l["value_loss"]  for l in per_agent_logs])
+            ent = np.mean([l["entropy"]     for l in per_agent_logs])
+            seac= np.mean([l["seac_loss"]   for l in per_agent_logs])
+            snd = np.mean([l["snd_loss"]    for l in per_agent_logs])
+            print(f"(Upd {j:>5d}) steps {steps_done:>7d} | {fps:4.0f} FPS | meanR {meanR:6.3f} "
+                  f"| pol {pol:+.4f} | val {val:+.4f} | ent {ent:.3f} | seac {seac:+.4f} | snd {snd:+.4f}")
 
-        # ------- 日志 / 保存 / 评估 -------
-        if j % log_interval == 0 and all_infos:
-            squashed = _squash_info(all_infos)
-            total_steps = (j + 1) * algorithm["num_processes"] * algorithm["num_steps"]
-            fps = int(total_steps / (time.time() - start))
-            logging.getLogger("main").info(
-                f"Upd {j} | steps {total_steps} | FPS {fps} | meanR {squashed.get('episode_reward', 0.0):.3f}"
-            )
-            # Sacred 记录
-            for k, v in squashed.items():
-                _run.log_scalar(k, v, j)
-            # ====== 新增：把聚合指标也写到 TB（W&B 将自动同步这些标量）======
-            if writer:
-                for k, v in squashed.items():
-                    writer.add_scalar(k, v, j)
-            all_infos.clear()
-
-        if save_interval and (j % save_interval == 0 or j == num_updates):
-            cur_dir = path.join(save_dir, f"u{j}")
-            os.makedirs(cur_dir, exist_ok=True)
-            for a in agents:
-                a.save(path.join(cur_dir, f"agent{a.agent_id}"))
-            shutil.make_archive(cur_dir, "xztar", save_dir, f"u{j}")
-            shutil.rmtree(cur_dir)
-
-        if eval_interval and (j % eval_interval == 0 or j == num_updates):
-            evaluate(agents, os.path.join(eval_dir, f"u{j}"))
+            if use_wandb:
+                metrics = {
+                    "global_step": steps_done,
+                    "fps": fps,
+                    "mean_reward": meanR,
+                    "policy_loss": pol,
+                    "value_loss":  val,
+                    "entropy":     ent,
+                    "seac_loss":   seac,
+                    "snd_loss":    snd,
+                }
+                # 逐 agent
+                for idx, l in enumerate(per_agent_logs):
+                    for k, v in l.items():
+                        metrics[f"agent{idx}/{k}"] = v
+                wandb.log(metrics)
 
     envs.close()
-    if writer:
-        writer.close()
-    # 优雅结束 W&B（若开启）
     if use_wandb:
-        try:
-            import wandb
-            wandb.finish()
-        except Exception:
-            pass
+        wandb.finish()
